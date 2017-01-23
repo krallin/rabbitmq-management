@@ -19,7 +19,7 @@
 -export([init/3, rest_init/2, resource_exists/2, to_json/2,
          content_types_provided/2, content_types_accepted/2,
          is_authorized/2, allowed_methods/2, accept_content/2,
-         delete_resource/2, user/1, put_user/2, put_user/3]).
+         delete_resource/2, user/1, put_user/1, put_user/2]).
 -export([variances/2]).
 
 -import(rabbit_misc, [pget/2]).
@@ -79,53 +79,111 @@ is_authorized(ReqData, Context) ->
 user(ReqData) ->
     rabbit_auth_backend_internal:lookup_user(rabbit_mgmt_util:id(user, ReqData)).
 
-put_user(User, ActingUser) -> put_user(User, undefined, ActingUser).
+put_user(User) -> put_user(User, undefined).
 
-put_user(User, Version, ActingUser) ->
-    PasswordUpdateFun = 
-        fun(Username) ->
-                case {maps:is_key(password, User),
-                      maps:is_key(password_hash, User)} of
-                    {true, _} ->
-                        rabbit_auth_backend_internal:change_password(
-                          Username, maps:get(password, User, undefined),
-                          ActingUser);
-                    {_, true} ->
-                        HashingAlgorithm = hashing_algorithm(User, Version),
+put_user(User, Version) ->
+    Username        = pget(name, User),
+    HasPassword     = proplists:is_defined(password, User),
+    HasPasswordHash = proplists:is_defined(password_hash, User),
+    Password        = pget(password, User),
+    PasswordHash    = pget(password_hash, User),
 
-                        Hash = rabbit_mgmt_util:b64decode_or_throw(
-                                 maps:get(password_hash, User, undefined)),
-                        rabbit_auth_backend_internal:change_password_hash(
-                          Username, Hash, HashingAlgorithm);
-                    _         ->
-                        rabbit_auth_backend_internal:clear_password(Username, ActingUser)
-                end
+    Tags            = case {pget(tags, User), pget(administrator, User)} of
+                          {undefined, undefined} ->
+                              throw({error, tags_not_present});
+                          {undefined, AdminS} ->
+                              case rabbit_mgmt_util:parse_bool(AdminS) of
+                                  true  -> [administrator];
+                                  false -> []
+                              end;
+                          {TagsS, _} ->
+                              [list_to_atom(string:strip(T)) ||
+                                  T <- string:tokens(binary_to_list(TagsS), ",")]
+                      end,
+
+    UserExists      = case rabbit_auth_backend_internal:lookup_user(Username) of
+                          %% expected
+                          {error, not_found} -> false;
+                          %% shouldn't normally happen but worth guarding
+                          %% against
+                          {error, _}         -> false;
+                          _                  -> true
+                      end,
+
+    PassedCredentialValidation =
+        case {HasPassword, HasPasswordHash} of
+            {true, false} ->
+                rabbit_credential_validation:validate(Username, Password) =:= ok;
+            {false, true} -> true;
+            _             -> false
         end,
-    put_user0(User, PasswordUpdateFun, ActingUser).
 
-put_user0(User, PasswordUpdateFun, ActingUser) ->
-    Username = maps:get(name, User, undefined),
-    Tags = case {maps:get(tags, User, undefined), maps:get(administrator, User, undefined)} of
-               {undefined, undefined} ->
-                   throw({error, tags_not_present});
-               {undefined, AdminS} ->
-                   case rabbit_mgmt_util:parse_bool(AdminS) of
-                       true  -> [administrator];
-                       false -> []
-                   end;
-               {TagsS, _} ->
-                   [list_to_atom(string:strip(T)) ||
-                       T <- string:tokens(binary_to_list(TagsS), ",")]
-           end,
-    case rabbit_auth_backend_internal:lookup_user(Username) of
-        {error, not_found} ->
-            rabbit_auth_backend_internal:add_user(
-              Username, rabbit_guid:binary(rabbit_guid:gen_secure(), "tmp"), ActingUser);
-        _ ->
-            ok
-    end,
-    PasswordUpdateFun(Username),
-    ok = rabbit_auth_backend_internal:set_tags(Username, Tags, ActingUser).
+    case UserExists of
+        true  ->
+            case {HasPassword, HasPasswordHash} of
+                {true, false} ->
+                    update_user_password(PassedCredentialValidation, Username, Password, Tags);
+                {false, true} ->
+                    update_user_password_hash(Username, PasswordHash, Tags, User, Version);
+                {true, true} ->
+                    throw({error, both_password_and_password_hash_are_provided});
+                %% clears password
+                _ ->
+                    rabbit_auth_backend_internal:clear_password(Username)
+            end;
+        false ->
+            case {HasPassword, HasPasswordHash} of
+                {true, false}  ->
+                    create_user_with_password(PassedCredentialValidation, Username, Password, Tags);
+                {false, true}  ->
+                    create_user_with_password_hash(Username, PasswordHash, Tags, User, Version);
+                {true, true}   ->
+                    throw({error, both_password_and_password_hash_are_provided});
+                {false, false} ->
+                    throw({error, no_password_or_password_hash_provided})
+            end
+    end.
+
+update_user_password(_PassedCredentialValidation = true,  Username, Password, Tags) ->
+    rabbit_auth_backend_internal:change_password(Username, Password),
+    rabbit_auth_backend_internal:set_tags(Username, Tags);
+update_user_password(_PassedCredentialValidation = false, _Username, _Password, _Tags) ->
+    %% we don't log here because
+    %% rabbit_auth_backend_internal will do it
+    throw({error, credential_validation_failed}).
+
+update_user_password_hash(Username, PasswordHash, Tags, User, Version) ->
+    %% when a hash this provided, credential validation
+    %% is not applied
+    HashingAlgorithm = hashing_algorithm(User, Version),
+
+    Hash = rabbit_mgmt_util:b64decode_or_throw(PasswordHash),
+    rabbit_auth_backend_internal:change_password_hash(
+      Username, Hash, HashingAlgorithm),
+    rabbit_auth_backend_internal:set_tags(Username, Tags).
+
+create_user_with_password(_PassedCredentialValidation = true,  Username, Password, Tags) ->
+    rabbit_auth_backend_internal:add_user(Username, Password),
+    rabbit_auth_backend_internal:set_tags(Username, Tags);
+create_user_with_password(_PassedCredentialValidation = false, _Username, _Password, _Tags) ->
+    %% we don't log here because
+    %% rabbit_auth_backend_internal will do it
+    throw({error, credential_validation_failed}).
+
+create_user_with_password_hash(Username, PasswordHash, Tags, User, Version) ->
+    %% when a hash this provided, credential validation
+    %% is not applied
+    HashingAlgorithm = hashing_algorithm(User, Version),
+    Hash             = rabbit_mgmt_util:b64decode_or_throw(PasswordHash),
+
+    %% first we create a user with dummy credentials and no
+    %% validation applied, then we update password hash
+    TmpPassword = rabbit_guid:binary(rabbit_guid:gen_secure(), "tmp"),
+    rabbit_auth_backend_internal:add_user_sans_validation(Username, TmpPassword),
+
+    rabbit_auth_backend_internal:change_password_hash(
+      Username, Hash, HashingAlgorithm),
+    rabbit_auth_backend_internal:set_tags(Username, Tags).
 
 hashing_algorithm(User, Version) ->
     case maps:get(hashing_algorithm, User, undefined) of
